@@ -155,12 +155,9 @@ fn listen_changed_client(sender: Sender<Message>, mut receiver: Receiver<bool>) 
         while let Some(true) = receiver.recv().await {
             if let Some(lock) = CLIPBOARD_LOCK.get() {
                 if !lock.load(Ordering::SeqCst) {
-                    println!("not locked");
                     if let Ok(text) = clipboard.get_text() {
-                        println!("clipboard text is {}", text);
                         let sender = sender.clone();
                         tokio::spawn(async move {
-                            println!("sending clipboard message: text={}", text);
                             sender
                                 .send(Message {
                                     r#type: "text".to_owned(),
