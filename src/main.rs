@@ -87,6 +87,13 @@ impl message::clipboard_service_server::ClipboardService for ClipboardServiceImp
         &self,
         request: Request<Streaming<message::Message>>,
     ) -> Result<Response<Self::ChangedStream>, Status> {
+        if let Some(addr) = request.remote_addr() {
+            println!(
+                "new connection received: {}:{}",
+                addr.ip().to_string(),
+                addr.port()
+            );
+        }
         let mut stream = request.into_inner();
 
         let (tx, rx) = tokio::sync::mpsc::channel(32);
@@ -155,6 +162,8 @@ async fn start_client(host: &str) -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let outbound = ReceiverStream::new(rx);
     let mut stream = client.changed(outbound).await?.into_inner();
+
+    println!("successful connected to: {}", host);
 
     tokio::spawn(async move {
         let mut clipboard = Clipboard::new().unwrap();
