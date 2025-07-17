@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package message;
+
+service ClipboardService {
+  rpc Changed(stream Message) returns (stream Message);
+}
+
+message Message {
+  string type = 1;
+  bytes body = 2;
+}
+
