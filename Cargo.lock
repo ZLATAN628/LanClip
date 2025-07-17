@@ -9,6 +9,7 @@ dependencies = [
  "arboard",
  "clap",
  "clipboard-master",
+ "once_cell",
  "prost",
  "tokio",
  "tonic",

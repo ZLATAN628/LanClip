@@ -4,6 +4,9 @@ use crate::message::Message;
 use arboard::Clipboard;
 use clap::{Parser, Subcommand};
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};
+use once_cell::sync::OnceCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -12,65 +15,23 @@ pub mod message {
     include!(concat!(env!("OUT_DIR"), "/message.rs"));
 }
 
-struct ServerHandler {
-    clipboard: Clipboard,
-    sender: tokio::sync::mpsc::Sender<Result<Message, Status>>,
+static CLIPBOARD_LOCK: OnceCell<AtomicBool> = OnceCell::new();
+
+struct Handler {
+    sender: Sender<bool>,
 }
 
-impl ServerHandler {
-    pub fn new(sender: tokio::sync::mpsc::Sender<Result<Message, Status>>) -> Self {
-        Self {
-            clipboard: Clipboard::new().unwrap(),
-            sender,
-        }
+impl Handler {
+    pub fn new(sender: Sender<bool>) -> Self {
+        Self { sender }
     }
 }
 
-impl ClipboardHandler for ServerHandler {
+impl ClipboardHandler for Handler {
     fn on_clipboard_change(&mut self) -> CallbackResult {
-        if let Ok(text) = self.clipboard.get_text() {
-            let sender = self.sender.clone();
-            tokio::task::spawn(async move {
-                sender
-                    .send(Ok(Message {
-                        r#type: "text".to_owned(),
-                        body: text.into_bytes(),
-                    }))
-                    .await
-                    .ok();
-            });
-        }
-        CallbackResult::Next
-    }
-}
-
-struct ClientHandler {
-    clipboard: Clipboard,
-    sender: tokio::sync::mpsc::Sender<Message>,
-}
-
-impl ClientHandler {
-    pub fn new(sender: tokio::sync::mpsc::Sender<Message>) -> Self {
-        Self {
-            clipboard: Clipboard::new().unwrap(),
-            sender,
-        }
-    }
-}
-
-impl ClipboardHandler for ClientHandler {
-    fn on_clipboard_change(&mut self) -> CallbackResult {
-        if let Ok(text) = self.clipboard.get_text() {
-            let sender = self.sender.clone();
-            tokio::task::spawn(async move {
-                sender
-                    .send(Message {
-                        r#type: "text".to_owned(),
-                        body: text.into_bytes(),
-                    })
-                    .await
-                    .ok();
-            });
+        let sender = self.sender.clone();
+        if let Err(e) = sender.blocking_send(true) {
+            eprintln!("send failed: {}", e);
         }
         CallbackResult::Next
     }
@@ -94,22 +55,14 @@ impl message::clipboard_service_server::ClipboardService for ClipboardServiceImp
                 addr.port()
             );
         }
-        let mut stream = request.into_inner();
-
+        let stream = request.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(32);
 
-        tokio::spawn(async move {
-            let mut clipboard = Clipboard::new().unwrap();
+        accept_remote_message(stream);
 
-            while let Ok(Some(msg)) = stream.message().await {
-                deal_message(&mut clipboard, msg);
-            }
-        });
-
-        tokio::spawn(async move {
-            let mut master = Master::new(ServerHandler::new(tx)).unwrap();
-            master.run().unwrap();
-        });
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        listen_changed_server(tx, receiver);
+        start_clipboard_listener(sender);
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -119,7 +72,10 @@ fn deal_message(clipboard: &mut Clipboard, msg: Message) {
     match msg.r#type.as_ref() {
         "text" => {
             if let Ok(text) = String::from_utf8(msg.body) {
-                clipboard.set_text(text).ok();
+                if let Some(lock) = CLIPBOARD_LOCK.get() {
+                    lock.store(true, Ordering::SeqCst);
+                    clipboard.set_text(text).ok();
+                }
             }
         }
         _ => {
@@ -149,6 +105,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    CLIPBOARD_LOCK.set(AtomicBool::new(false)).unwrap();
     let cli = Cli::parse();
     match cli.command {
         Command::Client { addr } => start_client(&addr).await,
@@ -161,26 +118,93 @@ async fn start_client(host: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let outbound = ReceiverStream::new(rx);
-    let mut stream = client.changed(outbound).await?.into_inner();
+    let stream = client.changed(outbound).await?.into_inner();
 
     println!("successful connected to: {}", host);
 
+    accept_remote_message(stream);
+
+    let (sender, receiver) = tokio::sync::mpsc::channel::<bool>(1);
+    listen_changed_client(tx, receiver);
+    start_clipboard_listener(sender);
+
+    tokio::signal::ctrl_c().await?;
+
+    Ok(())
+}
+
+fn accept_remote_message(mut stream: Streaming<Message>) {
     tokio::spawn(async move {
         let mut clipboard = Clipboard::new().unwrap();
         while let Ok(Some(msg)) = stream.message().await {
             deal_message(&mut clipboard, msg);
         }
     });
+}
 
-    tokio::spawn(async move {
-        let handler = ClientHandler::new(tx);
-        let mut master = Master::new(handler).unwrap();
+fn start_clipboard_listener(sender: Sender<bool>) {
+    std::thread::spawn(move || {
+        let mut master = Master::new(Handler::new(sender)).unwrap();
         master.run().unwrap();
     });
+}
 
-    tokio::signal::ctrl_c().await?;
+fn listen_changed_client(sender: Sender<Message>, mut receiver: Receiver<bool>) {
+    tokio::spawn(async move {
+        let mut clipboard = Clipboard::new().unwrap();
+        while let Some(true) = receiver.recv().await {
+            if let Some(lock) = CLIPBOARD_LOCK.get() {
+                if !lock.load(Ordering::SeqCst) {
+                    println!("not locked");
+                    if let Ok(text) = clipboard.get_text() {
+                        println!("clipboard text is {}", text);
+                        let sender = sender.clone();
+                        tokio::spawn(async move {
+                            println!("sending clipboard message: text={}", text);
+                            sender
+                                .send(Message {
+                                    r#type: "text".to_owned(),
+                                    body: text.into_bytes(),
+                                })
+                                .await
+                                .ok();
+                        });
+                    }
+                } else {
+                    lock.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+    });
+}
 
-    Ok(())
+fn listen_changed_server(
+    sender: tokio::sync::mpsc::Sender<Result<Message, Status>>,
+    mut receiver: Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let mut clipboard = Clipboard::new().unwrap();
+        while let Some(true) = receiver.recv().await {
+            if let Some(lock) = CLIPBOARD_LOCK.get() {
+                if !lock.load(Ordering::SeqCst) {
+                    if let Ok(text) = clipboard.get_text() {
+                        let sender = sender.clone();
+                        tokio::spawn(async move {
+                            sender
+                                .send(Ok(Message {
+                                    r#type: "text".to_owned(),
+                                    body: text.into_bytes(),
+                                }))
+                                .await
+                                .ok();
+                        });
+                    }
+                } else {
+                    lock.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+    });
 }
 
 async fn start_server(port: i32) -> Result<(), Box<dyn std::error::Error>> {
