@@ -4,9 +4,12 @@ use arboard::Clipboard;
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};
 use once_cell::sync::OnceCell;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::Notify;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 
 static CLIPBOARD_LOCK: OnceCell<AtomicBool> = OnceCell::new();
+static STATE_LOCK: OnceCell<AtomicBool> = OnceCell::new();
 
 pub struct ClipboardClient {
     host: String,
@@ -24,6 +27,10 @@ impl Handler {
 
 impl ClipboardHandler for Handler {
     fn on_clipboard_change(&mut self) -> CallbackResult {
+        if !STATE_LOCK.get().unwrap().load(Ordering::SeqCst) {
+            return CallbackResult::Stop;
+        }
+
         if let Err(e) = self.sender.blocking_send(()) {
             eprintln!("send failed: {}", e);
         }
@@ -33,6 +40,8 @@ impl ClipboardHandler for Handler {
 
 impl ClipboardClient {
     pub fn new(host: &str) -> Self {
+        CLIPBOARD_LOCK.set(AtomicBool::new(false)).ok();
+        STATE_LOCK.set(AtomicBool::new(true)).ok();
         Self {
             host: host.to_string(),
         }
@@ -45,16 +54,15 @@ impl ClipboardClient {
         let mut stream = client.changed(outbound).await?.into_inner();
         println!("successful connected to: {}", self.host);
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<()>(1);
-        let mut master = Master::new(Handler::new(sender)).unwrap();
-        let close_channel = master.shutdown_channel();
+        let close_notifier = Arc::new(Notify::new());
 
         tokio::spawn(async move {
             let mut clipboard = Clipboard::new().unwrap();
             while let Ok(Some(msg)) = stream.message().await {
                 ClipboardClient::deal_message(&mut clipboard, msg);
             }
-            close_channel.signal();
             println!("connection closed");
+            STATE_LOCK.get().unwrap().store(false, Ordering::SeqCst);
         });
 
         tokio::spawn(async move {
@@ -80,9 +88,14 @@ impl ClipboardClient {
             }
         });
 
+        let close_notifier_clone = close_notifier.clone();
         std::thread::spawn(move || {
+            let mut master = Master::new(Handler::new(sender)).unwrap();
             master.run().unwrap();
+            close_notifier_clone.notify_one();
         });
+
+        close_notifier.notified().await;
         Ok(())
     }
 
