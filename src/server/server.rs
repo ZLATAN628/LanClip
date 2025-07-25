@@ -1,8 +1,9 @@
 use crate::listener::Follower;
-use arboard::Clipboard;
+use crate::message;
+use arboard::{Clipboard, ImageData};
+use std::borrow::Cow;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use crate::message;
 
 #[derive(Clone)]
 pub struct ClipboardServiceImpl {
@@ -53,6 +54,18 @@ impl message::clipboard_service_server::ClipboardService for ClipboardServiceImp
                             sender.send(id.clone()).ok();
                             clipboard.set_text(text).ok();
                         }
+                    }
+                    "image" => {
+                        let w: [u8; 4] = msg.body[0..4].to_vec().try_into().unwrap();
+                        let h: [u8; 4] = msg.body[4..8].to_vec().try_into().unwrap();
+                        let width = u32::from_le_bytes(w) as usize;
+                        let height = u32::from_le_bytes(h) as usize;
+                        let image_data = ImageData {
+                            width,
+                            height,
+                            bytes: Cow::from(&msg.body[8..]),
+                        };
+                        clipboard.set_image(image_data).ok();
                     }
                     _ => {
                         println!("not supported type: {}", msg.r#type);

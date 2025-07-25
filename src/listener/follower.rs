@@ -1,5 +1,4 @@
 use crate::message::Message;
-use arboard::Clipboard;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot::Receiver;
 use uuid::Uuid;
@@ -30,22 +29,13 @@ impl Follower {
         matches!(self.state, Status::WORKING)
     }
 
-    pub fn changed(&mut self) {
+    pub fn send(&mut self, message: Result<Message, tonic::Status>) {
         if let Ok(_) = self.receiver.try_recv() {
             self.state = Status::STOPPED;
             return;
         }
 
-        let mut clipboard = Clipboard::new().unwrap();
-        if let Ok(text) = clipboard.get_text() {
-            let sender = self.sender.clone();
-            sender
-                .blocking_send(Ok(Message {
-                    r#type: "text".to_owned(),
-                    body: text.into_bytes(),
-                }))
-                .ok();
-        }
+        self.sender.blocking_send(message).ok();
     }
 
     pub fn id(&self) -> &String {

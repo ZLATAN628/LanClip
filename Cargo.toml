@@ -6,11 +6,24 @@ edition = "2021"
 [dependencies]
 arboard = "3.6.0"
 clap = { version = "4.5.41", features = ["derive"] }
-clipboard-master = "=4.0.0-beta.6"
 once_cell = "1.21.3"
 prost = "0.13.5"
 tokio = { version = "1.46.1", features = ["full"] }
 tonic = "0.13.1"
 uuid = { version = "1.17.0", features = ["v4"] }
+image = "0.25"
 [build-dependencies]
 tonic-build = "0.13.1"
+
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.0" }
+objc2-app-kit = { version = "0.3.0", features = ["NSPasteboard", "NSPasteboardItem"] }
+objc2-foundation = { version = "0.3.0", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSString",
+    "NSEnumerator",
+    "NSGeometry",
+    "NSValue",
+] }

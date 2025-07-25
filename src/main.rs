@@ -1,6 +1,7 @@
 mod client;
 mod listener;
 mod server;
+mod clipboard;
 
 use crate::client::ClipboardClient;
 use crate::listener::{ClipboardListener, Follower};

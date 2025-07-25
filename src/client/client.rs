@@ -1,8 +1,9 @@
+use crate::clipboard::{CallbackResult, ClipboardHandler, ClipboardType, Master};
 use crate::message::clipboard_service_client::ClipboardServiceClient;
 use crate::message::Message;
-use arboard::Clipboard;
-use clipboard_master::{CallbackResult, ClipboardHandler, Master};
+use arboard::{Clipboard, ImageData};
 use once_cell::sync::OnceCell;
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -16,22 +17,22 @@ pub struct ClipboardClient {
 }
 
 struct Handler {
-    sender: tokio::sync::mpsc::Sender<()>,
+    sender: tokio::sync::mpsc::Sender<ClipboardType>,
 }
 
 impl Handler {
-    pub fn new(sender: tokio::sync::mpsc::Sender<()>) -> Self {
+    pub fn new(sender: tokio::sync::mpsc::Sender<ClipboardType>) -> Self {
         Self { sender }
     }
 }
 
 impl ClipboardHandler for Handler {
-    fn on_clipboard_change(&mut self) -> CallbackResult {
+    fn on_clipboard_change(&mut self, r#type: ClipboardType) -> CallbackResult {
         if !STATE_LOCK.get().unwrap().load(Ordering::SeqCst) {
             return CallbackResult::Stop;
         }
 
-        if let Err(e) = self.sender.blocking_send(()) {
+        if let Err(e) = self.sender.blocking_send(r#type) {
             eprintln!("send failed: {}", e);
         }
         CallbackResult::Next
@@ -53,7 +54,7 @@ impl ClipboardClient {
         let outbound = ReceiverStream::new(rx);
         let mut stream = client.changed(outbound).await?.into_inner();
         println!("successful connected to: {}", self.host);
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<()>(1);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<ClipboardType>(1);
         let close_notifier = Arc::new(Notify::new());
 
         tokio::spawn(async move {
@@ -67,19 +68,46 @@ impl ClipboardClient {
 
         tokio::spawn(async move {
             let mut clipboard = Clipboard::new().unwrap();
-            while let Some(_) = receiver.recv().await {
+            while let Some(clipboard_type) = receiver.recv().await {
                 if let Some(lock) = CLIPBOARD_LOCK.get() {
                     if !lock.load(Ordering::SeqCst) {
-                        if let Ok(text) = clipboard.get_text() {
-                            let tx = tx.clone();
-                            tokio::spawn(async move {
-                                tx.send(Message {
-                                    r#type: "text".to_owned(),
-                                    body: text.into_bytes(),
-                                })
-                                .await
-                                .ok();
-                            });
+                        match clipboard_type {
+                            ClipboardType::TEXT => {
+                                if let Ok(text) = clipboard.get_text() {
+                                    let tx = tx.clone();
+                                    tokio::spawn(async move {
+                                        tx.send(Message {
+                                            r#type: "text".to_owned(),
+                                            body: text.into_bytes(),
+                                        })
+                                        .await
+                                        .ok();
+                                    });
+                                }
+                            }
+                            ClipboardType::IMAGE => {
+                                if let Ok(image) = clipboard.get_image() {
+                                    if image.bytes.len() > 10 * 1024 * 1024 {
+                                        println!("image is too large: {}", image.bytes.len());
+                                        return;
+                                    }
+                                    let mut data = Vec::with_capacity(image.bytes.len() + 8);
+                                    data.extend_from_slice(&image.width.to_le_bytes());
+                                    data.extend_from_slice(&image.height.to_le_bytes());
+                                    data.extend_from_slice(&image.bytes);
+
+                                    let tx = tx.clone();
+                                    tokio::spawn(async move {
+                                        tx.send(Message {
+                                            r#type: "image".to_owned(),
+                                            body: data,
+                                        })
+                                        .await
+                                        .ok();
+                                    });
+                                }
+                            }
+                            _ => {}
                         }
                     } else {
                         lock.store(false, Ordering::SeqCst);
@@ -108,6 +136,18 @@ impl ClipboardClient {
                         clipboard.set_text(text).ok();
                     }
                 }
+            }
+            "image" => {
+                let w: [u8; 4] = msg.body[0..4].to_vec().try_into().unwrap();
+                let h: [u8; 4] = msg.body[4..8].to_vec().try_into().unwrap();
+                let width = u32::from_le_bytes(w) as usize;
+                let height = u32::from_le_bytes(h) as usize;
+                let image_data = ImageData {
+                    width,
+                    height,
+                    bytes: Cow::from(&msg.body[8..]),
+                };
+                clipboard.set_image(image_data).ok();
             }
             _ => {
                 println!("not supported type: {}", msg.r#type);
